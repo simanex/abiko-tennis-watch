@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-我孫子市民体育館テニスコート（A〜E）の日曜日の空きを監視し、
-12:00〜16:00 の中で連続2時間以上空いていれば通知する。
+我孫子市民体育館テニスコート（A〜E）の土日祝の空きを監視し、
+12:00〜16:00 の中で連続1時間以上空いていれば通知する。
 
 - ちば施設予約システムをログインなしで閲覧（空き状況検索）
 - 新しく見つかった空きだけ通知（state.json で既通知分を管理）
@@ -17,12 +17,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
+import jpholiday
 from playwright.sync_api import Page, sync_playwright
 
 BASE_URL = "https://www.cm1.eprs.jp/yoyaku-chiba/ew/index.jsp"
 WINDOW_START = os.getenv("WINDOW_START", "12:00")
 WINDOW_END = os.getenv("WINDOW_END", "16:00")
-MIN_MINUTES = int(os.getenv("MIN_MINUTES", "120"))
+MIN_MINUTES = int(os.getenv("MIN_MINUTES", "60"))
 STATE_FILE = Path(os.getenv("STATE_FILE", Path(__file__).with_name("state.json")))
 JST = dt.timezone(dt.timedelta(hours=9))
 
@@ -58,6 +59,20 @@ def find_hits(slots: list[tuple[str, str]]) -> list[str]:
             hits.append(f"{to_hhmm(cs)}-{to_hhmm(ce)}")
     return hits
 
+def head_to_date(head: str, today: dt.date) -> dt.date | None:
+    """表の見出し（例: '11/29(土)' や '2026/11/29(土)'）を日付に変換"""
+    m = re.search(r"(?:(\d{4})/)?(\d{1,2})/(\d{1,2})", head)
+    if not m:
+        return None
+    y, mo, d = m.groups()
+    mo, d = int(mo), int(d)
+    year = int(y) if y else today.year + (1 if mo < today.month else 0)  # 年末年始の対応
+    return dt.date(year, mo, d)
+
+
+def is_target_day(d: dt.date) -> bool:
+    """土日か祝日ならTrue"""
+    return d.weekday() >= 5 or jpholiday.is_holiday(d)
 
 # ---------- ブラウザ操作 ----------
 
@@ -88,7 +103,7 @@ def next_sunday(today: dt.date) -> dt.date:
     return today + dt.timedelta(days=(6 - today.weekday()) % 7)
 
 
-def open_sunday_view(page: Page) -> None:
+def open_sunday_view(page: Page, start: dt.date) -> None:
     page.goto(BASE_URL, wait_until="load")
     click_text(page, "施設の空き状況")
     click(page, "h.includes('InstSrchPpsdAction')")  # 利用目的から
@@ -96,17 +111,22 @@ def open_sunday_view(page: Page) -> None:
         click_text(page, label)
 
     # カレンダーで直近の日曜を選ぶ（月をまたぐ場合は翌月へ）
-    sunday = next_sunday(dt.datetime.now(JST).date())
+    sunday = start
     day_href = f", {sunday.year}, {sunday.month}, {sunday.day})"
-    if not page.query_selector(f"a[href*='{day_href}']"):
-        click(page, f"h.includes('moveCalender') && h.includes(', {sunday.year}, {sunday.month})')")
+    now = dt.datetime.now(JST)
+    y, m = now.year, now.month
+    while not page.query_selector(f"a[href*='{day_href}']"):
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)  # 翌月へ
+        if (y, m) > (sunday.year, sunday.month):
+            raise RuntimeError(f"カレンダーに {sunday} が見つかりません")
+        click(page, f"h.includes('moveCalender') && h.includes(', {y}, {m})')")
     page.evaluate(
         f"""() => {{
             const links = [...document.querySelectorAll('a')];
             const day = links.find(a => (a.getAttribute('href')||'').includes(', {sunday.year}, {sunday.month}, {sunday.day})'));
             if (!day) throw new Error('日付リンクが見つかりません');
             day.click();
-            links.find(a => (a.getAttribute('href')||'').includes('weektype6')).click();  // 曜日指定: 日
+                links.filter(a => /weektype[567]/.test(a.getAttribute('href')||'')).forEach(a => a.click()); // 土日祝
         }}"""
     )
     click(page, "h.includes('sendSelectDay')")  # 検索開始
@@ -137,28 +157,39 @@ EXTRACT_JS = r"""() => {
 }"""
 
 
-def scrape() -> list[dict]:
+def scrape(weeks: int = 7) -> list[dict]:
     results = []
+    today = dt.datetime.now(JST).date()
+    until = today + dt.timedelta(weeks=weeks)
     with sync_playwright() as p:
         browser = p.chromium.launch(headless=True)
         page = browser.new_page(locale="ja-JP")
         try:
-            open_sunday_view(page)
-            while True:
-                data = page.evaluate(EXTRACT_JS)
-                if not data:
-                    raise RuntimeError("空き状況の表が見つかりません")
-                court = data["court"].split(" ")[-1]
-                for head, slots in zip(data["heads"], data["days"]):
-                    for hit in find_hits([tuple(s) for s in slots]):
-                        results.append({"date": head, "court": court, "time": hit})
-                if not data["hasNext"]:
-                    break
-                click_text(page, "次の施設")
+            start = today
+            while start < until:
+                open_sunday_view(page, start)
+                last = start
+                while True:
+                    data = page.evaluate(EXTRACT_JS)
+                    if not data:
+                        raise RuntimeError("空き状況の表が見つかりません")
+                    court = data["court"].split(" ")[-1]
+                    for head, slots in zip(data["heads"], data["days"]):
+                        d = head_to_date(head, today)
+                        if d is None:
+                            continue
+                        last = max(last, d)
+                        if not is_target_day(d):
+                            continue
+                        for hit in find_hits([tuple(s) for s in slots]):
+                            results.append({"date": head, "court": court, "time": hit})
+                    if not data["hasNext"]:
+                        break
+                    click_text(page, "次の施設")
+                start = last + dt.timedelta(days=1)  # 表の最後の日の翌日から次の検索
         finally:
             browser.close()
     return results
-
 
 # ---------- 通知 ----------
 
@@ -212,7 +243,7 @@ def main() -> int:
     print(f"[{dt.datetime.now(JST):%F %R}] 該当 {len(keys)} 件 / 新規 {len(new)} 件")
     if new:
         lines = [f"・{k.replace('|', ' ')}" for k in new]
-        notify("🎾 我孫子市民体育館テニスに日曜の空きが出ました\n"
+        notify("🎾 我孫子市民体育館テニスに土日祝の空きが出ました\n"
                + "\n".join(lines)
                + "\n予約はこちら（要ログイン）: " + BASE_URL)
     return 0
